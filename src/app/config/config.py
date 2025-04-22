@@ -4,7 +4,7 @@
 from pathlib import Path
 from functools import lru_cache
 from pydantic import BaseSettings
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 
 class Settings(BaseSettings):
@@ -23,6 +23,19 @@ class Settings(BaseSettings):
     DEFAULT_MAX_TOKENS: int = 1024
     DEFAULT_TEMPERATURE: float = 0.0
     DEFAULT_TOP_P: float = 1.0
+    # タイムアウト設定（秒）
+    MODEL_TIMEOUT: float = 60.0
+    # 再試行設定
+    MAX_RETRIES: int = 3
+    RETRY_BACKOFF_MIN: float = 2.0
+    RETRY_BACKOFF_MAX: float = 30.0
+    RETRY_BACKOFF_MULTIPLIER: float = 1.5
+
+    # プロバイダ設定
+    ENABLED_PROVIDERS: List[str] = ["ollama", "openai", "anthropic"]
+    # キャッシュ設定
+    ENABLE_LITELLM_CACHE: bool = True
+    CACHE_EXPIRATION: int = 3600  # 秒
 
     # 処理設定
     BATCH_SIZE: int = 5
@@ -53,6 +66,32 @@ class Settings(BaseSettings):
         if self.PROJECT_ROOT:
             self.RESULTS_DIR = self.PROJECT_ROOT / "results"
             self.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    def get_provider_settings(self, provider_name: str) -> Dict[str, Any]:
+        """
+        特定プロバイダの設定を取得する
+
+        Args:
+            provider_name: プロバイダ名
+
+        Returns:
+            設定辞書
+        """
+        # プロバイダ固有の設定を返す
+        if provider_name == "openai":
+            return {
+                "base_url": self.OPENAI_API_BASE,
+                "api_key": self.OPENAI_API_KEY
+            }
+        elif provider_name == "anthropic":
+            return {
+                "api_key": self.ANTHROPIC_API_KEY
+            }
+        elif provider_name == "ollama":
+            return {
+                "base_url": self.LITELLM_BASE_URL
+            }
+        return {}
 
 
 @lru_cache()

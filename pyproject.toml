@@ -11,6 +11,8 @@ dependencies = [
     "mlflow>=2.21.3",
     "pandas>=2.2.3",
     "uvicorn>=0.34.2",
+    "tenacity>=8.2.3",
+    "redis>=5.0.1",
 ]
 
 [build-system]

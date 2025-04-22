@@ -9,6 +9,9 @@ import pandas as pd
 from tqdm import tqdm
 import sys
 import datetime
+import time
+import random
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # 設定のインポート
 from app.config import get_settings
@@ -31,6 +34,19 @@ logger = logging.getLogger(__name__)
 
 # 評価メトリクスの関数マッピングを動的に取得
 METRICS_FUNC_MAP = get_metrics_functions()
+
+# LiteLLM呼び出しの例外定義
+class LiteLLMAPIError(Exception):
+    """LiteLLM API呼び出し中のエラー"""
+    pass
+
+class LiteLLMTimeoutError(Exception):
+    """LiteLLM API呼び出しのタイムアウトエラー"""
+    pass
+
+class LiteLLMRateLimitError(Exception):
+    """LiteLLM APIのレート制限エラー"""
+    pass
 
 async def get_few_shot_samples(dataset_name: str, n_shots: int) -> List[Dict[str, str]]:
     """
@@ -92,11 +108,80 @@ async def format_prompt(instruction: str, input_text: str, few_shots: List[Dict[
 
     return messages
 
-async def call_model_with_litellm(messages: List[Dict[str, str]],
-                                model_name: str,
-                                provider_name: str,
-                                max_tokens: int = settings.DEFAULT_MAX_TOKENS,
-                                temperature: float = settings.DEFAULT_TEMPERATURE) -> str:
+# リトライポリシーを使用したモデル呼び出し関数
+@retry(
+    retry=retry_if_exception_type((LiteLLMTimeoutError, LiteLLMRateLimitError)), 
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    reraise=True
+)
+async def call_model_with_retry(
+    messages: List[Dict[str, str]],
+    model_name: str,
+    provider_name: str,
+    max_tokens: int,
+    temperature: float,
+    additional_params: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """
+    リトライロジックを含むモデル呼び出し関数
+
+    Args:
+        messages: メッセージのリスト
+        model_name: モデル名
+        provider_name: プロバイダ名
+        max_tokens: 最大トークン数
+        temperature: 温度
+        additional_params: 追加パラメータ
+
+    Returns:
+        LiteLLMのレスポンス
+    """
+    # プロバイダとモデル名を結合（LiteLLMの形式に合わせる）
+    full_model_name = f"{provider_name}/{model_name}"
+    
+    # リクエストパラメータの設定
+    request_params = {
+        "model": full_model_name,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "base_url": settings.LITELLM_BASE_URL,
+    }
+    
+    # 追加パラメータの適用
+    if additional_params:
+        request_params.update(additional_params)
+    
+    try:
+        # カスタムタイムアウト設定でAPIを呼び出し
+        response = await asyncio.wait_for(
+            acompletion(**request_params),
+            timeout=settings.MODEL_TIMEOUT
+        )
+        return response
+    except asyncio.TimeoutError:
+        logger.warning(f"Timeout calling model {full_model_name}")
+        raise LiteLLMTimeoutError(f"Timeout calling model {full_model_name}")
+    except Exception as e:
+        error_message = str(e).lower()
+        if "rate limit" in error_message or "too many requests" in error_message:
+            logger.warning(f"Rate limit error calling model {full_model_name}: {e}")
+            # レート制限エラーは再試行
+            raise LiteLLMRateLimitError(f"Rate limit error: {str(e)}")
+        else:
+            # その他のエラーは記録して再発生
+            logger.error(f"Error calling model {full_model_name}: {e}")
+            raise LiteLLMAPIError(f"API error: {str(e)}")
+
+async def call_model_with_litellm(
+    messages: List[Dict[str, str]],
+    model_name: str,
+    provider_name: str,
+    max_tokens: int = settings.DEFAULT_MAX_TOKENS,
+    temperature: float = settings.DEFAULT_TEMPERATURE,
+    additional_params: Optional[Dict[str, Any]] = None
+) -> str:
     """
     LiteLLMを使用してモデルを呼び出す関数
 
@@ -106,28 +191,32 @@ async def call_model_with_litellm(messages: List[Dict[str, str]],
         provider_name: プロバイダ名
         max_tokens: 最大トークン数
         temperature: 温度
+        additional_params: 追加パラメータ辞書
 
     Returns:
         モデルの出力テキスト
     """
-    # プロバイダとモデル名を結合（LiteLLMの形式に合わせる）
-    full_model_name = f"{provider_name}/{model_name}"
-
     try:
-        response = await acompletion(
-            model=full_model_name,
+        # リトライロジックを含む関数を呼び出し
+        response = await call_model_with_retry(
             messages=messages,
+            model_name=model_name,
+            provider_name=provider_name,
             max_tokens=max_tokens,
             temperature=temperature,
-            base_url=settings.LITELLM_BASE_URL
+            additional_params=additional_params
         )
         return response.choices[0].message.content
+    except (LiteLLMAPIError, LiteLLMTimeoutError, LiteLLMRateLimitError) as e:
+        logger.error(f"Failed after retries: {e}")
+        return f"ERROR: {str(e)}"
     except Exception as e:
-        logger.error(f"Error calling model {full_model_name}: {e}")
-        return ""
+        logger.error(f"Unexpected error: {e}")
+        return f"ERROR: Unexpected error occurred: {str(e)}"
 
 async def process_batch(batch: List[Dict], model_name: str, provider_name: str,
-                       instruction: str, output_length: int, n_shots: int, dataset_name: str):
+                       instruction: str, output_length: int, n_shots: int, dataset_name: str,
+                       additional_params: Optional[Dict[str, Any]] = None):
     """
     バッチ処理を行う関数
 
@@ -139,6 +228,7 @@ async def process_batch(batch: List[Dict], model_name: str, provider_name: str,
         output_length: 出力の最大長
         n_shots: Few-shotサンプル数
         dataset_name: データセット名
+        additional_params: 追加パラメータ辞書
 
     Returns:
         処理結果のリスト
@@ -152,7 +242,8 @@ async def process_batch(batch: List[Dict], model_name: str, provider_name: str,
             messages=messages,
             model_name=model_name,
             provider_name=provider_name,
-            max_tokens=output_length
+            max_tokens=output_length,
+            additional_params=additional_params
         )
 
         # 出力の前処理（テキスト整形など）
@@ -174,7 +265,8 @@ async def run_evaluation(
     provider_name: str,
     model_name: str,
     num_samples: int,
-    n_shots: List[int]
+    n_shots: List[int],
+    additional_params: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
     評価の実行プロセス
@@ -185,6 +277,7 @@ async def run_evaluation(
         model_name: モデル名
         num_samples: 評価するサンプル数
         n_shots: Few-shotサンプル数のリスト
+        additional_params: 追加パラメータ辞書
 
     Returns:
         評価結果を含む辞書
@@ -214,19 +307,30 @@ async def run_evaluation(
                 instruction=instruction,
                 output_length=output_length,
                 n_shots=shot,
-                dataset_name=dataset_name
+                dataset_name=dataset_name,
+                additional_params=additional_params
             )
             shot_results.extend(batch_results)
+
+        error_count = sum(1 for result in shot_results if result["processed_output"].startswith("ERROR:"))
+        if error_count > 0:
+            logger.warning(f"{error_count} out of {len(shot_results)} samples failed with errors")
 
         for metric_name in metrics:
             if metric_name in METRICS_FUNC_MAP:
                 metric_func = METRICS_FUNC_MAP[metric_name]
                 scores = [
                     metric_func(result["processed_output"], result["expected_output"])
-                    for result in shot_results
+                    for result in shot_results if not result["processed_output"].startswith("ERROR:")
                 ]
-                avg_score = sum(scores) / len(scores) if scores else 0
-                all_results[f"{dataset_name}_{shot}shot_{metric_name}"] = avg_score
+                if scores:  # エラーを除いたスコアがある場合のみ平均を計算
+                    avg_score = sum(scores) / len(scores)
+                    all_results[f"{dataset_name}_{shot}shot_{metric_name}"] = avg_score
+                    # エラー率も記録
+                    all_results[f"{dataset_name}_{shot}shot_{metric_name}_error_rate"] = error_count / len(shot_results)
+                else:
+                    all_results[f"{dataset_name}_{shot}shot_{metric_name}"] = 0
+                    all_results[f"{dataset_name}_{shot}shot_{metric_name}_error_rate"] = 1.0
             else:
                 logger.warning(f"Metric '{metric_name}' specified in dataset but not found in registry")
 
@@ -243,9 +347,13 @@ async def run_evaluation(
         # all_results のキーから実際に測定された指標だけ追加
         prefix = f"{dataset_name}_{shot}shot_"
         for key, value in all_results.items():
-            if key.startswith(prefix) and not key.endswith("_details"):
+            if key.startswith(prefix) and not key.endswith("_details") and not key.endswith("_error_rate"):
                 metric_name = key[len(prefix):]
                 row[metric_name] = value
+                # エラー率も追加
+                error_rate_key = f"{prefix}{metric_name}_error_rate"
+                if error_rate_key in all_results:
+                    row[f"{metric_name}_error_rate"] = all_results[error_rate_key]
         summary.append(row)
 
     return {
@@ -265,15 +373,30 @@ async def run_multiple_evaluations(
     provider_name: str,
     model_name: str,
     num_samples: int,
-    n_shots: List[int]
+    n_shots: List[int],
+    additional_params: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
+    """
+    複数データセットに対する評価を実行する関数
+
+    Args:
+        datasets: 評価するデータセットのリスト
+        provider_name: プロバイダ名
+        model_name: モデル名
+        num_samples: 評価するサンプル数
+        n_shots: Few-shotサンプル数のリスト
+        additional_params: 追加パラメータ辞書
+
+    Returns:
+        評価結果の辞書
+    """
     results = {}
     all_summary: List[Dict[str, Any]] = []
     timestamp = datetime.datetime.now().isoformat()
 
     for dataset_name in datasets:
         dataset_results = await run_evaluation(
-            dataset_name, provider_name, model_name, num_samples, n_shots
+            dataset_name, provider_name, model_name, num_samples, n_shots, additional_params
         )
         results[dataset_name] = dataset_results
         # 辞書リストをそのままマージ
@@ -288,11 +411,23 @@ async def run_multiple_evaluations(
             "datasets": datasets,
             "num_samples": num_samples,
             "n_shots": n_shots,
-            "timestamp": timestamp
+            "timestamp": timestamp,
+            "additional_params": additional_params
         }
     }
 
 def save_results_as_json(results: Dict[str, Any], provider_name: str, model_name: str) -> Path:
+    """
+    評価結果をJSONファイルとして保存する関数
+
+    Args:
+        results: 評価結果辞書
+        provider_name: プロバイダ名
+        model_name: モデル名
+
+    Returns:
+        保存したファイルのパス
+    """
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"{provider_name}_{model_name}_{timestamp}.json"
     file_path = settings.RESULTS_DIR / filename
@@ -326,6 +461,11 @@ async def main():
     datasets = ["aio", "janli"]  # 評価するデータセット
     num_samples = settings.DEFAULT_NUM_SAMPLES  # 評価するサンプル数
     n_shots = settings.DEFAULT_N_SHOTS  # Few-shotサンプル数
+    
+    # 追加パラメータ（例：カスタムヘッダー）
+    additional_params = {
+        "headers": {"User-Agent": "LLM-Evaluation-Tool/1.0"}
+    }
 
     # 利用可能なメトリクスを表示
     logger.info(f"Available metrics: {list(METRICS_FUNC_MAP.keys())}")
@@ -341,7 +481,8 @@ async def main():
         provider_name=provider_name,
         model_name=model_name,
         num_samples=num_samples,
-        n_shots=n_shots
+        n_shots=n_shots,
+        additional_params=additional_params
     )
 
     # 結果の保存
