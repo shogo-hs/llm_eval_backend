@@ -19,6 +19,9 @@ from app.config import get_settings
 # 評価メトリクスのインポート（動的読み込みを使用）
 from app.metrics import get_metrics_functions
 
+# モデル管理コントローラーのインポート
+from app.utils.model_management import get_model_controller
+
 # 設定の取得
 settings = get_settings()
 
@@ -31,6 +34,9 @@ logging.basicConfig(
     format=settings.LOG_FORMAT
 )
 logger = logging.getLogger(__name__)
+
+# モデル管理コントローラーのインスタンス取得
+model_controller = get_model_controller()
 
 # 評価メトリクスの関数マッピングを動的に取得
 METRICS_FUNC_MAP = get_metrics_functions()
@@ -46,6 +52,10 @@ class LiteLLMTimeoutError(Exception):
 
 class LiteLLMRateLimitError(Exception):
     """LiteLLM APIのレート制限エラー"""
+    pass
+
+class ModelNotAvailableError(Exception):
+    """モデルが利用できないエラー"""
     pass
 
 async def get_few_shot_samples(dataset_name: str, n_shots: int) -> List[Dict[str, str]]:
@@ -137,6 +147,13 @@ async def call_model_with_retry(
     Returns:
         LiteLLMのレスポンス
     """
+    # モデルが利用可能かどうかをチェック
+    if settings.MODEL_CHECK_BEFORE_CALL:
+        available, message = await model_controller.ensure_model_availability(provider_name, model_name)
+        if not available:
+            logger.error(f"Model {model_name} is not available: {message}")
+            raise ModelNotAvailableError(message)
+    
     # プロバイダとモデル名を結合（LiteLLMの形式に合わせる）
     full_model_name = f"{provider_name}/{model_name}"
     
@@ -174,14 +191,87 @@ async def call_model_with_retry(
             logger.error(f"Error calling model {full_model_name}: {e}")
             raise LiteLLMAPIError(f"API error: {str(e)}")
 
+async def try_fallback_providers(
+    messages: List[Dict[str, str]],
+    primary_provider: str,
+    primary_model: str,
+    max_tokens: int,
+    temperature: float,
+    additional_params: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """
+    フォールバックプロバイダーを使用して処理を試みる関数
+    
+    Args:
+        messages: メッセージのリスト
+        primary_provider: 最初に使用するプロバイダー
+        primary_model: 最初に使用するモデル
+        max_tokens: 最大トークン数
+        temperature: 温度
+        additional_params: 追加パラメータ
+        
+    Returns:
+        (レスポンス, 使用したプロバイダー, 使用したモデル)のタプル
+    """
+    # 最初のプロバイダーを試す
+    try:
+        response = await call_model_with_retry(
+            messages=messages,
+            model_name=primary_model,
+            provider_name=primary_provider,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            additional_params=additional_params
+        )
+        return response, primary_provider, primary_model
+    except (LiteLLMAPIError, LiteLLMTimeoutError, LiteLLMRateLimitError, ModelNotAvailableError) as e:
+        logger.warning(f"Primary provider {primary_provider} failed: {e}")
+        
+    # フォールバックプロバイダーが設定されていない場合はそのままエラーを発生
+    if not settings.FALLBACK_PROVIDERS:
+        raise LiteLLMAPIError(f"Primary provider {primary_provider} failed and no fallback providers configured")
+    
+    # フォールバックプロバイダーを順番に試す
+    for fallback_provider in settings.FALLBACK_PROVIDERS:
+        # 同じプロバイダーはスキップ
+        if fallback_provider == primary_provider:
+            continue
+            
+        logger.info(f"Trying fallback provider: {fallback_provider}")
+        
+        # フォールバック用のモデル名を決定（実装によって最適なモデルを選択できる）
+        fallback_model = primary_model
+        if fallback_provider != primary_provider:
+            # ここで必要に応じてプロバイダーに適したモデルに変更
+            # 例: OpenAIのgpt-4-turboに対応するAnthropicのモデルを選ぶなど
+            # この実装例では単純化のため同じモデル名を使用
+            pass
+        
+        try:
+            response = await call_model_with_retry(
+                messages=messages,
+                model_name=fallback_model,
+                provider_name=fallback_provider,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                additional_params=additional_params
+            )
+            return response, fallback_provider, fallback_model
+        except (LiteLLMAPIError, LiteLLMTimeoutError, LiteLLMRateLimitError, ModelNotAvailableError) as e:
+            logger.warning(f"Fallback provider {fallback_provider} failed: {e}")
+    
+    # すべてのフォールバックが失敗
+    raise LiteLLMAPIError("All providers failed")
+
 async def call_model_with_litellm(
     messages: List[Dict[str, str]],
     model_name: str,
     provider_name: str,
     max_tokens: int = settings.DEFAULT_MAX_TOKENS,
     temperature: float = settings.DEFAULT_TEMPERATURE,
-    additional_params: Optional[Dict[str, Any]] = None
-) -> str:
+    additional_params: Optional[Dict[str, Any]] = None,
+    use_fallback: bool = True
+) -> Dict[str, Any]:
     """
     LiteLLMを使用してモデルを呼び出す関数
 
@@ -192,27 +282,55 @@ async def call_model_with_litellm(
         max_tokens: 最大トークン数
         temperature: 温度
         additional_params: 追加パラメータ辞書
+        use_fallback: フォールバックプロバイダーを使用するかどうか
 
     Returns:
-        モデルの出力テキスト
+        (モデルの出力テキスト、使用したプロバイダー、使用したモデル)の辞書
     """
     try:
-        # リトライロジックを含む関数を呼び出し
-        response = await call_model_with_retry(
-            messages=messages,
-            model_name=model_name,
-            provider_name=provider_name,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            additional_params=additional_params
-        )
-        return response.choices[0].message.content
-    except (LiteLLMAPIError, LiteLLMTimeoutError, LiteLLMRateLimitError) as e:
+        if use_fallback and settings.FALLBACK_PROVIDERS:
+            # フォールバックロジックを使用
+            response, used_provider, used_model = await try_fallback_providers(
+                messages=messages,
+                primary_provider=provider_name,
+                primary_model=model_name,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                additional_params=additional_params
+            )
+        else:
+            # リトライロジックを含む関数を呼び出し（フォールバックなし）
+            response = await call_model_with_retry(
+                messages=messages,
+                model_name=model_name,
+                provider_name=provider_name,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                additional_params=additional_params
+            )
+            used_provider = provider_name
+            used_model = model_name
+            
+        return {
+            "content": response.choices[0].message.content,
+            "provider": used_provider,
+            "model": used_model
+        }
+            
+    except (LiteLLMAPIError, LiteLLMTimeoutError, LiteLLMRateLimitError, ModelNotAvailableError) as e:
         logger.error(f"Failed after retries: {e}")
-        return f"ERROR: {str(e)}"
+        return {
+            "content": f"ERROR: {str(e)}",
+            "provider": provider_name,
+            "model": model_name
+        }
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
-        return f"ERROR: Unexpected error occurred: {str(e)}"
+        return {
+            "content": f"ERROR: Unexpected error occurred: {str(e)}",
+            "provider": provider_name,
+            "model": model_name
+        }
 
 async def process_batch(batch: List[Dict], model_name: str, provider_name: str,
                        instruction: str, output_length: int, n_shots: int, dataset_name: str,
@@ -238,7 +356,7 @@ async def process_batch(batch: List[Dict], model_name: str, provider_name: str,
 
     for sample in batch:
         messages = await format_prompt(instruction, sample["input"], few_shots)
-        raw_output = await call_model_with_litellm(
+        response = await call_model_with_litellm(
             messages=messages,
             model_name=model_name,
             provider_name=provider_name,
@@ -247,6 +365,7 @@ async def process_batch(batch: List[Dict], model_name: str, provider_name: str,
         )
 
         # 出力の前処理（テキスト整形など）
+        raw_output = response["content"]
         processed_output = raw_output.strip()
         # 必要に応じて、さらに処理を追加
 
@@ -255,7 +374,9 @@ async def process_batch(batch: List[Dict], model_name: str, provider_name: str,
             "expected_output": sample["output"],
             "raw_output": raw_output,
             "processed_output": processed_output,
-            "messages": [{"role": m["role"], "content": m["content"]} for m in messages]
+            "messages": [{"role": m["role"], "content": m["content"]} for m in messages],
+            "provider": response["provider"],  # 使用したプロバイダー
+            "model": response["model"]         # 使用したモデル
         })
 
     return results
@@ -311,6 +432,17 @@ async def run_evaluation(
                 additional_params=additional_params
             )
             shot_results.extend(batch_results)
+
+        # プロバイダー別にカウント
+        providers_used = {}
+        for result in shot_results:
+            used_provider = result.get("provider", provider_name)
+            providers_used[used_provider] = providers_used.get(used_provider, 0) + 1
+            
+        # プロバイダー使用状況のログ
+        for provider, count in providers_used.items():
+            percentage = (count / len(shot_results)) * 100
+            logger.info(f"Provider {provider} used for {count}/{len(shot_results)} samples ({percentage:.2f}%)")
 
         error_count = sum(1 for result in shot_results if result["processed_output"].startswith("ERROR:"))
         if error_count > 0:
@@ -456,11 +588,26 @@ async def main():
     メイン関数
     """
     # 評価設定 - 設定からデフォルト値を使用
-    provider_name = "ollama"
+    provider_name = settings.DEFAULT_PROVIDER
     model_name = "phi4:latest"
     datasets = ["aio", "janli"]  # 評価するデータセット
     num_samples = settings.DEFAULT_NUM_SAMPLES  # 評価するサンプル数
     n_shots = settings.DEFAULT_N_SHOTS  # Few-shotサンプル数
+    
+    # プロバイダーとモデルが利用可能か確認
+    available, message = await model_controller.ensure_model_availability(provider_name, model_name)
+    if not available:
+        logger.error(f"Model {model_name} is not available: {message}")
+        if settings.AUTO_DOWNLOAD_MODELS and provider_name == "ollama":
+            logger.info(f"Attempting to download model {model_name}")
+            success, dl_message = await model_controller.pull_ollama_model(model_name)
+            if not success:
+                logger.error(f"Failed to download model {model_name}: {dl_message}")
+                sys.exit(1)
+            logger.info(f"Model {model_name} downloaded successfully")
+        else:
+            logger.error("Model is not available and auto-download is disabled")
+            sys.exit(1)
     
     # 追加パラメータ（例：カスタムヘッダー）
     additional_params = {

@@ -31,8 +31,15 @@ class Settings(BaseSettings):
     RETRY_BACKOFF_MAX: float = 30.0
     RETRY_BACKOFF_MULTIPLIER: float = 1.5
 
+    # モデル管理設定
+    AUTO_DOWNLOAD_MODELS: bool = True  # モデルの自動ダウンロード設定
+    MODEL_CHECK_BEFORE_CALL: bool = True  # 呼び出し前にモデルの存在をチェックするかどうか
+
     # プロバイダ設定
     ENABLED_PROVIDERS: List[str] = ["ollama", "openai", "anthropic"]
+    DEFAULT_PROVIDER: str = "ollama"  # デフォルトプロバイダー
+    FALLBACK_PROVIDERS: List[str] = []  # フォールバックプロバイダー（順番に試行）
+    
     # キャッシュ設定
     ENABLE_LITELLM_CACHE: bool = True
     CACHE_EXPIRATION: int = 3600  # 秒
