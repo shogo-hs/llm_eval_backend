@@ -10,23 +10,25 @@ from tqdm import tqdm
 import sys
 import datetime
 
-# 設定のインポート
-from app.config import get_settings
+# パッケージ構造の問題を解決
+sys.path.append("/work/hasegawa/llm_eval_backend")
 
 # 評価メトリクスのインポート
 from app.metrics.char_f1 import CharF1
 from app.metrics.exact_match import ExactMatch
 
-# 設定の取得
-settings = get_settings()
+# パスの設定
+DATASET_DIR = Path("/work/hasegawa/llm_eval/datasets/jaster/1.3.0/evaluation/test/")
+TRAIN_DIR = Path("/work/hasegawa/llm_eval/datasets/jaster/1.3.0/evaluation/train/")
+RESULTS_DIR = Path("../../../results/")
 
 # 結果ディレクトリの作成
-settings.initialize_dirs()
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # ロギングの設定
 logging.basicConfig(
-    level=getattr(logging, settings.LOG_LEVEL),
-    format=settings.LOG_FORMAT
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
@@ -50,7 +52,7 @@ async def get_few_shot_samples(dataset_name: str, n_shots: int) -> List[Dict[str
     if n_shots == 0:
         return []
 
-    dataset_path = settings.TRAIN_DIR / f"{dataset_name}.json"
+    dataset_path = TRAIN_DIR / f"{dataset_name}.json"
 
     with dataset_path.open(encoding="utf-8") as f:
         train_data = json.load(f)
@@ -99,8 +101,8 @@ async def format_prompt(instruction: str, input_text: str, few_shots: List[Dict[
 async def call_model_with_litellm(messages: List[Dict[str, str]],
                                 model_name: str,
                                 provider_name: str,
-                                max_tokens: int = settings.DEFAULT_MAX_TOKENS,
-                                temperature: float = settings.DEFAULT_TEMPERATURE) -> str:
+                                max_tokens: int,
+                                temperature: float = 0.0) -> str:
     """
     LiteLLMを使用してモデルを呼び出す関数
 
@@ -123,7 +125,7 @@ async def call_model_with_litellm(messages: List[Dict[str, str]],
             messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
-            base_url=settings.LITELLM_BASE_URL
+            base_url="http://192.168.101.204:11434/api/generate"
         )
         return response.choices[0].message.content
     except Exception as e:
@@ -193,8 +195,8 @@ async def run_evaluation(
     Returns:
         評価結果を含む辞書
     """
-    dataset_path = settings.DATASET_DIR / f"{dataset_name}.json"
-    batch_size = settings.BATCH_SIZE
+    dataset_path = DATASET_DIR / f"{dataset_name}.json"
+    batch_size = 5
 
     with dataset_path.open(encoding="utf-8") as f:
         dataset = json.load(f)
@@ -297,7 +299,7 @@ async def run_multiple_evaluations(
 def save_results_as_json(results: Dict[str, Any], provider_name: str, model_name: str) -> Path:
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"{provider_name}_{model_name}_{timestamp}.json"
-    file_path = settings.RESULTS_DIR / filename
+    file_path = RESULTS_DIR / filename
 
     # pandas 不要。results["summary"] は List[Dict] のまま
     json_results = {
@@ -322,12 +324,12 @@ async def main():
     """
     メイン関数
     """
-    # 評価設定 - 設定からデフォルト値を使用
+    # 評価設定
     provider_name = "ollama"
     model_name = "phi4:latest"
     datasets = ["aio", "janli"]  # 評価するデータセット
-    num_samples = settings.DEFAULT_NUM_SAMPLES  # 評価するサンプル数
-    n_shots = settings.DEFAULT_N_SHOTS  # Few-shotサンプル数
+    num_samples = 10  # 評価するサンプル数
+    n_shots = [0, 2]  # Few-shotサンプル数
 
     logger.info(f"Starting evaluation: {provider_name}/{model_name}")
     logger.info(f"Datasets: {datasets}")
