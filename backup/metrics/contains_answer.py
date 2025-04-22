@@ -1,10 +1,9 @@
 """
 回答を含むかどうかの評価指標モジュール
 """
-from .base import BaseMetric, register_metric
+from .base import BaseMetric
 
 
-@register_metric
 class ContainsAnswer(BaseMetric):
     """
     回答を含むかどうかの評価指標

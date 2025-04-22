@@ -13,8 +13,9 @@ import datetime
 # 設定のインポート
 from app.config import get_settings
 
-# 評価メトリクスのインポート（動的読み込みを使用）
-from app.metrics import get_metrics_functions
+# 評価メトリクスのインポート
+from app.metrics.char_f1 import CharF1
+from app.metrics.exact_match import ExactMatch
 
 # 設定の取得
 settings = get_settings()
@@ -29,8 +30,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# 評価メトリクスの関数マッピングを動的に取得
-METRICS_FUNC_MAP = get_metrics_functions()
+# 評価メトリクスの関数マッピング
+METRICS_FUNC_MAP = {
+    "char_f1": CharF1().calculate,
+    "exact_match": ExactMatch().calculate,
+}
 
 async def get_few_shot_samples(dataset_name: str, n_shots: int) -> List[Dict[str, str]]:
     """
@@ -227,8 +231,6 @@ async def run_evaluation(
                 ]
                 avg_score = sum(scores) / len(scores) if scores else 0
                 all_results[f"{dataset_name}_{shot}shot_{metric_name}"] = avg_score
-            else:
-                logger.warning(f"Metric '{metric_name}' specified in dataset but not found in registry")
 
         all_results[f"{dataset_name}_{shot}shot_details"] = shot_results
 
@@ -326,9 +328,6 @@ async def main():
     datasets = ["aio", "janli"]  # 評価するデータセット
     num_samples = settings.DEFAULT_NUM_SAMPLES  # 評価するサンプル数
     n_shots = settings.DEFAULT_N_SHOTS  # Few-shotサンプル数
-
-    # 利用可能なメトリクスを表示
-    logger.info(f"Available metrics: {list(METRICS_FUNC_MAP.keys())}")
 
     logger.info(f"Starting evaluation: {provider_name}/{model_name}")
     logger.info(f"Datasets: {datasets}")

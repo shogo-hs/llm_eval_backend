@@ -1,11 +1,10 @@
 """
 文字ベースのF1スコア評価指標モジュール
 """
-from .base import BaseMetric, register_metric
+from .base import BaseMetric
 from fuzzywuzzy import fuzz
 
 
-@register_metric
 class CharF1(BaseMetric):
     """
     文字ベースのF1スコア評価指標

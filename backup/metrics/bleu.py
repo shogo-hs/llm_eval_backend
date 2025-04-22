@@ -1,10 +1,9 @@
 """
 BLEUスコア評価指標モジュール
 """
-from .base import BaseMetric, register_metric
+from .base import BaseMetric
 
 
-@register_metric
 class BLEUScore(BaseMetric):
     """
     BLEUスコア評価指標

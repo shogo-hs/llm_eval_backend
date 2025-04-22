@@ -1,10 +1,9 @@
 """
 集合ベースのF1スコア評価指標モジュール
 """
-from .base import BaseMetric, register_metric
+from ..base import BaseMetric
 
 
-@register_metric
 class SetF1(BaseMetric):
     """
     集合ベースのF1スコア評価指標

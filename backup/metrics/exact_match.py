@@ -1,10 +1,9 @@
 """
 完全一致評価指標モジュール
 """
-from .base import BaseMetric, register_metric
+from .base import BaseMetric
 
 
-@register_metric
 class ExactMatch(BaseMetric):
     """
     完全一致評価指標
