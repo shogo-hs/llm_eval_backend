@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./src:/app/src
+      - ./results:/app/results
+    environment:
+      - LLMEVAL_ENV=development
+      - LLMEVAL_LOG_LEVEL=INFO
+      - LLMEVAL_LITELLM_BASE_URL=http://llm-service:11434/api/generate
+    restart: unless-stopped
+    networks:
+      - llm-eval-network
+
+  # LLMサービス（Ollamaなど）と接続する場合のサンプル設定
+  # llm-service:
+  #   image: ollama/ollama:latest
+  #   ports:
+  #     - "11434:11434"
+  #   volumes:
+  #     - ollama-data:/root/.ollama
+  #   networks:
+  #     - llm-eval-network
+
+networks:
+  llm-eval-network:
+    driver: bridge
+
+# volumes:
+#   ollama-data:
